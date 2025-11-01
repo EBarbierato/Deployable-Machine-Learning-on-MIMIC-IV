@@ -1,0 +1,431 @@
+from sklearn.metrics import make_scorer, roc_auc_score, average_precision_score
+
+def make_scorer_from_metric(metric: str):
+    m = metric.lower()
+    if m in ("auroc", "roc_auc", "roc"):
+        return make_scorer(roc_auc_score, needs_threshold=True)
+    if m in ("auprc", "pr_auc", "average_precision"):
+        return make_scorer(average_precision_score, needs_threshold=True)
+    raise ValueError(f"Unsupported metric for permutation importance: {metric}")
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+10_explainability.py — robust global explainability for single‑task baselines.
+- Coefficients / native importances
+- Permutation importance (VAL) with selectable metric (AUPRC default)
+- SHAP global summaries (if shap available)
+- Risk deciles and simple error-slice summaries
+
+Inputs:
+  --x-val      : Parquet with validation features (must include 'subject_id')
+  --labels     : Parquet with labels (must include 'subject_id' and label col)
+  --label-col  : Name of the binary incident label (e.g., diab_incident_365d)
+  --model-type : logistic | random_forest | xgboost
+  --model-path : Path to model.joblib as saved by 06_train_baselines.py
+
+Outputs (under --outdir):
+  explain_global.csv, risk_deciles.csv, error_slices.csv (optional),
+  EXPLAIN.md, shap_summary_sample.parquet (optional)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, brier_score_loss, log_loss, make_scorer
+)
+
+# Optional: xgboost, shap
+try:
+    import xgboost as xgb  # type: ignore
+    _HAVE_XGB = True
+except Exception:
+    xgb = None  # type: ignore
+    _HAVE_XGB = False
+
+try:
+    import shap  # type: ignore
+    _HAVE_SHAP = True
+except Exception:
+    shap = None  # type: ignore
+    _HAVE_SHAP = False
+
+
+# ----------------------------- CLI ------------------------------------------
+
+def str2bool(v: str) -> bool:
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Global explainability for baseline classifiers (coeffs/importances, permutation, SHAP).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    p.add_argument("--x-val", type=str, required=True, help="Validation feature matrix (Parquet) with 'subject_id'.")
+    p.add_argument("--labels", type=str, required=True, help="Labels parquet with 'subject_id' and the label column.")
+    p.add_argument("--label-col", type=str, required=True)
+
+    p.add_argument("--model-type", type=str, choices=["logistic", "random_forest", "xgboost"], required=True)
+    p.add_argument("--model-path", type=str, required=True, help="Path to model.joblib saved by 06_train_baselines.py")
+
+    p.add_argument("--metric", type=str, choices=["auprc", "auroc", "brier", "logloss"], default="auprc",
+                   help="Metric for permutation importance (higher is better).")
+    p.add_argument("--top-k", type=int, default=30, help="Top features to list in EXPLAIN.md")
+    p.add_argument("--shap", type=str2bool, default=True, help="Compute SHAP summaries (if shap available).")
+    p.add_argument("--shap-n-sample", type=int, default=2000, help="Max rows from VAL to use for SHAP.")
+    p.add_argument("--shap-bg", type=int, default=200, help="Background sample size for SHAP's Linear/Kernel explainer.")
+    p.add_argument("--outdir", type=str, default="artifacts/explain", help="Output directory.")
+    return p.parse_args()
+
+
+# ----------------------------- I/O Utils ------------------------------------
+
+def _load_matrix(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    if "subject_id" not in df.columns:
+        raise KeyError(f"{path} must include 'subject_id'.")
+    return df
+
+def _load_label_map(path: Path, col: str) -> pd.DataFrame:
+    lab = pd.read_parquet(path)
+    need = {"subject_id", col}
+    missing = need - set(lab.columns)
+    if missing:
+        raise KeyError(f"labels file missing columns: {missing}")
+    out = lab[["subject_id", col]].drop_duplicates("subject_id").copy()
+    out[col] = out[col].astype(bool).astype(int)
+    return out
+
+def _features_df(df_with_id: pd.DataFrame, id_col: str = "subject_id") -> Tuple[pd.DataFrame, List[str]]:
+    cols = [c for c in df_with_id.columns if c != id_col]
+    return df_with_id[cols].copy(), cols
+
+
+# ----------------------------- Metrics & Scorers -----------------------------
+
+def _metrics(y: np.ndarray, p: np.ndarray) -> Dict[str, float]:
+    eps = 1e-12
+    y = y.astype(int)
+    p = np.clip(p.astype(float), eps, 1 - eps)
+    out = {}
+    try: out["auroc"] = float(roc_auc_score(y, p))
+    except ValueError: out["auroc"] = float("nan")
+    try: out["auprc"] = float(average_precision_score(y, p))
+    except ValueError: out["auprc"] = float("nan")
+    out["brier"] = float(brier_score_loss(y, p))
+    try: out["logloss"] = float(log_loss(y, p))
+    except ValueError: out["logloss"] = float("nan")
+    out["pos_rate"] = float(np.mean(y))
+    return out
+
+def _make_scorer(name: str):
+    # For permutation_importance we want "higher is better" semantics.
+    if name == "auroc":
+        return make_scorer(roc_auc_score, needs_threshold=True)
+    if name == "brier":
+        # Negate Brier (loss) so that higher is better.
+        def _brier_pos(y_true, y_prob): return -brier_score_loss(y_true, y_prob)
+        return make_scorer(lambda yt, yp: _brier_pos(yt, yp), needs_threshold=True)
+    if name == "logloss":
+        def _nll_pos(y_true, y_prob):
+            eps = 1e-12
+            return -log_loss(y_true, np.clip(y_prob, eps, 1 - eps))
+        return make_scorer(lambda yt, yp: _nll_pos(yt, yp), needs_threshold=True)
+    # Default: AUPRC
+    return make_scorer(average_precision_score, needs_threshold=True)
+
+
+# ----------------------------- Model Loader ---------------------------------
+
+def _load_model(model_type: str, model_path: Path):
+    mdl = joblib.load(model_path)
+    # Light validation
+    if model_type == "logistic" and not isinstance(mdl, LogisticRegression):
+        if not hasattr(mdl, "predict_proba"):
+            raise TypeError("Loaded model does not look like a LogisticRegression classifier.")
+    if model_type == "random_forest" and not isinstance(mdl, RandomForestClassifier):
+        if not hasattr(mdl, "predict_proba"):
+            raise TypeError("Loaded model does not look like a RandomForestClassifier.")
+    if model_type == "xgboost":
+        if not (_HAVE_XGB and (hasattr(mdl, "predict_proba") or (xgb is not None and isinstance(mdl, xgb.XGBClassifier)))):
+            raise TypeError("Loaded model is not an XGBClassifier (or xgboost not installed).")
+    return mdl
+
+
+# ----------------------------- Explainability Blocks ------------------------
+
+def coefficients_or_importances(model, model_type: str, feature_names: List[str]) -> pd.DataFrame:
+    rows: List[Dict[str, float | str]] = []
+    if model_type == "logistic" and hasattr(model, "coef_"):
+        coef = np.ravel(model.coef_)
+        for f, c in zip(feature_names, coef):
+            rows.append({
+                "feature": f, "value": float(c), "kind": "coefficient",
+                "derived": "odds_ratio", "derived_value": float(np.exp(c))
+            })
+    elif model_type == "random_forest" and hasattr(model, "feature_importances_"):
+        imp = np.ravel(model.feature_importances_)
+        for f, v in zip(feature_names, imp):
+            rows.append({
+                "feature": f, "value": float(v), "kind": "gini_importance",
+                "derived": "", "derived_value": float("nan")
+            })
+    elif model_type == "xgboost" and hasattr(model, "get_booster") and xgb is not None:
+        try:
+            booster = model.get_booster()
+            score_map = booster.get_score(importance_type="gain")
+            fmap = {f"f{i}": feature_names[i] for i in range(len(feature_names))}
+            for k, v in score_map.items():
+                rows.append({"feature": fmap.get(k, k), "value": float(v),
+                             "kind": "xgb_gain", "derived": "", "derived_value": float("nan")})
+        except Exception:
+            if hasattr(model, "feature_importances_"):
+                imp = np.ravel(model.feature_importances_)
+                for f, v in zip(feature_names, imp):
+                    rows.append({"feature": f, "value": float(v), "kind": "xgb_importance",
+                                 "derived": "", "derived_value": float("nan")})
+    return pd.DataFrame(rows)
+
+def compute_permutation_importance(model, X_df: pd.DataFrame, y: np.ndarray, feature_names: List[str],
+                                   metric_name: str, n_repeats: int = 10, random_state: int = 42) -> pd.DataFrame:
+    scorer = _make_scorer(metric_name)
+    # Pass a DataFrame to avoid "feature names" warnings in sklearn 1.7+
+    r = permutation_importance(model, X_df, y, scoring=scorer, n_repeats=n_repeats,
+                               random_state=random_state, n_jobs=-1)
+    df = pd.DataFrame({
+        "feature": feature_names,
+        "perm_importance_mean": r.importances_mean,
+        "perm_importance_std": r.importances_std
+    }).sort_values("perm_importance_mean", ascending=False).reset_index(drop=True)
+    return df
+
+def compute_shap(model, model_type: str, X_val_df: pd.DataFrame, feature_names: List[str],
+                 n_sample: int = 2000, bg_size: int = 200) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    if not _HAVE_SHAP:
+        return pd.DataFrame(), None
+
+    n = X_val_df.shape[0]
+    idx = np.arange(n)
+    if n > n_sample:
+        rs = np.random.RandomState(42)
+        idx = rs.choice(idx, size=n_sample, replace=False)
+    Xs_df = X_val_df.iloc[idx, :]
+    Xs = Xs_df.values
+
+    # Build explainer
+    try:
+        if model_type in {"random_forest", "xgboost"}:
+            explainer = shap.TreeExplainer(model)
+        elif model_type == "logistic" and hasattr(shap, "LinearExplainer"):
+            bg_idx = np.arange(min(bg_size, X_val_df.shape[0]))
+            explainer = shap.LinearExplainer(model, X_val_df.iloc[bg_idx, :].values, feature_dependence="independent")
+        else:
+            bg_idx = np.arange(min(bg_size, X_val_df.shape[0]))
+            explainer = shap.KernelExplainer(model.predict_proba, X_val_df.iloc[bg_idx, :].values)
+    except Exception:
+        return pd.DataFrame(), None
+
+    # Compute SHAP values for class 1 (binary setup)
+    try:
+        if hasattr(model, "predict_proba"):
+            sv = explainer.shap_values(Xs)
+            if isinstance(sv, list) and len(sv) == 2:
+                vals = sv[1]
+            else:
+                vals = sv
+        else:
+            return pd.DataFrame(), None
+    except Exception:
+        return pd.DataFrame(), None
+
+    vals = np.array(vals, dtype=np.float32)
+    shap_global = pd.DataFrame({
+        "feature": feature_names,
+        "shap_mean_abs": np.mean(np.abs(vals), axis=0),
+        "shap_mean": np.mean(vals, axis=0),
+        "shap_std_abs": np.std(np.abs(vals), axis=0)
+    }).sort_values("shap_mean_abs", ascending=False).reset_index(drop=True)
+
+    shap_sample = pd.DataFrame(vals, columns=feature_names)
+    return shap_global, shap_sample
+
+
+# ----------------------------- Risk Slices ----------------------------------
+
+def risk_deciles_and_slices(model, X_val_df: pd.DataFrame, y_val: np.ndarray,
+                            feature_names: List[str], top_features: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # Predict on DataFrame (keeps feature names consistent for sklearn 1.7+)
+    p = model.predict_proba(X_val_df)[:, 1]
+    n = len(p)
+    dec = pd.qcut(p, q=10, labels=False, duplicates="drop")
+    out_rows = []
+    for d in sorted(pd.Series(dec).dropna().unique()):
+        m = dec == d
+        yy = y_val[m]
+        pp = p[m]
+        stats = _metrics(yy, pp)
+        out_rows.append({
+            "decile": int(d) + 1,
+            "n": int(np.sum(m)),
+            "prevalence": float(np.mean(yy)) if np.sum(m) else float("nan"),
+            "auroc": stats["auroc"],
+            "auprc": stats["auprc"],
+            "brier": stats["brier"],
+            "logloss": stats["logloss"]
+        })
+    risk_dec = pd.DataFrame(out_rows).sort_values("decile")
+
+    # Error slices by top features (quartiles), measured at threshold 0.5 (illustrative)
+    err_rows = []
+    thr = 0.5
+    pred = (p >= thr).astype(int)
+    err = (pred != y_val.astype(int)).astype(int)
+    for f in top_features:
+        if f not in X_val_df.columns:
+            continue
+        vals = X_val_df[f].values
+        # Numeric only
+        try:
+            vals_float = pd.to_numeric(vals, errors="coerce")
+        except Exception:
+            continue
+        try:
+            q = pd.qcut(vals_float, q=4, duplicates="drop")
+        except Exception:
+            continue
+        for lvl in q.unique().categories if hasattr(q.unique(), "categories") else np.unique(q):
+            m = (q == lvl)
+            if np.sum(m) == 0:
+                continue
+            err_rate = float(np.mean(err[m]))
+            prev = float(np.mean(y_val[m]))
+            err_rows.append({"feature": f, "bin": str(lvl), "n": int(np.sum(m)),
+                             "error_rate_at_0.5": err_rate, "prevalence": prev})
+    slices = pd.DataFrame(err_rows)
+    return risk_dec, slices
+
+
+# ----------------------------- MAIN -----------------------------------------
+
+def main() -> int:
+    args = parse_args()
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Load data and join labels
+    X_val_df_all = _load_matrix(Path(args.x_val))
+    ymap = _load_label_map(Path(args.labels), args.label_col)
+    df = X_val_df_all.merge(ymap, on="subject_id", how="inner")
+    if df.empty:
+        raise ValueError("Join of validation features and labels is empty.")
+    y_val = df[args.label_col].astype(int).values
+    X_val_df = df.drop(columns=[args.label_col])
+    X_feats_df, feat_names = _features_df(X_val_df)
+
+    # Load model
+    model = _load_model(args.model_type, Path(args.model_path))
+
+    # Base metrics on VAL (uncalibrated model probabilities)
+    p_val = model.predict_proba(X_feats_df)[:, 1]
+    base_metrics = _metrics(y_val, p_val)
+
+    # 1) Coefficients / native importances
+    base_attr = coefficients_or_importances(model, args.model_type, feat_names)
+
+    # 2) Permutation importance (VAL)
+    perm = compute_permutation_importance(
+        model, X_feats_df, y_val, feat_names, metric_name=args.metric, n_repeats=10, random_state=42
+    )
+
+    # 3) SHAP summaries (optional)
+    shap_global, shap_sample = (pd.DataFrame(), None)
+    if args.shap:
+        shap_global, shap_sample = compute_shap(
+            model, args.model_type, X_feats_df, feat_names,
+            n_sample=args.shap_n_sample, bg_size=args.shap_bg
+        )
+
+    # Merge: outer by feature
+    tbl = base_attr.copy() if not base_attr.empty else pd.DataFrame({"feature": feat_names})
+    if perm is not None and not perm.empty:
+        tbl = tbl.merge(perm, on="feature", how="outer")
+    if not shap_global.empty:
+        tbl = tbl.merge(shap_global, on="feature", how="outer")
+
+    # Sorting preference: SHAP, then permutation, then |coef| for logistic
+    if "value" in tbl.columns and args.model_type == "logistic":
+        tbl["value_abs"] = tbl["value"].abs()
+    sort_cols = [c for c in ["shap_mean_abs", "perm_importance_mean", "value_abs"] if c in tbl.columns]
+    if sort_cols:
+        tbl = tbl.sort_values(by=sort_cols, ascending=[False]*len(sort_cols)).reset_index(drop=True)
+
+    # Persist explainability tables
+    tbl.to_csv(outdir / "explain_global.csv", index=False)
+    if shap_sample is not None:
+        shap_sample.to_parquet(outdir / "shap_summary_sample.parquet", index=False)
+
+    # Risk deciles and error slices
+    top_features = tbl["feature"].dropna().tolist()[:max(1, args.top_k)]
+    risk_dec, slices = risk_deciles_and_slices(model, X_feats_df, y_val, feat_names, top_features[:5])
+    risk_dec.to_csv(outdir / "risk_deciles.csv", index=False)
+    if not slices.empty:
+        slices.to_csv(outdir / "error_slices.csv", index=False)
+
+    # Human-readable summary (Markdown)
+    lines: List[str] = []
+    lines.append(f"# Explainability Summary\n\nGenerated: {datetime.utcnow().isoformat(timespec='seconds')}Z\n\n")
+    lines.append(f"Model: {args.model_type}\n\nLabel: {args.label_col}\n\n")
+    lines.append("Validation performance (uncalibrated probabilities)\n")
+    lines.append(f"- AUROC: {base_metrics['auroc']:.4f}\n")
+    lines.append(f"- AUPRC: {base_metrics['auprc']:.4f}\n")
+    lines.append(f"- Brier: {base_metrics['brier']:.4f}\n")
+    lines.append(f"- LogLoss: {base_metrics['logloss']:.4f}\n")
+    lines.append(f"- Positive rate: {base_metrics['pos_rate']:.4f}\n\n")
+    lines.append("Top features\n")
+    head = tbl.head(args.top_k).copy()
+    display_cols = [c for c in ["feature", "value", "derived_value", "perm_importance_mean", "shap_mean_abs"] if c in head.columns]
+    if not head.empty and display_cols:
+        lines.append(head[display_cols].to_markdown(index=False))
+        lines.append("\n\n")
+    lines.append("Risk deciles (validation)\n")
+    lines.append(risk_dec.to_markdown(index=False))
+    if not slices.empty:
+        lines.append("\n\nError slices (validation, threshold=0.5)\n")
+        lines.append(slices.head(40).to_markdown(index=False))
+    (outdir / "EXPLAIN.md").write_text("".join(lines))
+
+    # Metadata JSON
+    meta = {
+        "label": args.label_col,
+        "model_type": args.model_type,
+        "model_path": str(Path(args.model_path)),
+        "metric_for_permutation": args.metric,
+        "shap_available": bool(_HAVE_SHAP) and bool(args.shap),
+        "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    }
+    (outdir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    print(f"Wrote: {outdir / 'explain_global.csv'}")
+    print(f"Wrote: {outdir / 'risk_deciles.csv'}")
+    if not slices.empty:
+        print(f"Wrote: {outdir / 'error_slices.csv'}")
+    if shap_sample is not None:
+        print(f"Wrote: {outdir / 'shap_summary_sample.parquet'}")
+    print(f"Wrote: {outdir / 'EXPLAIN.md'}")
+    print(f"Wrote: {outdir / 'meta.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

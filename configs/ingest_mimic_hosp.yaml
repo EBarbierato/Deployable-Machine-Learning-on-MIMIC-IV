@@ -1,0 +1,16 @@
+input_root: "/home_local/corte/physionet.org/files/mimiciv/3.1/hosp"
+tables:
+  admissions:          "admissions.csv"
+  patients:            "patients.csv"
+  diagnoses_icd:       "diagnoses_icd.csv"
+  procedures_icd:      "procedures_icd.csv"
+  labevents:           "labevents.csv"
+  microbiologyevents:  "microbiologyevents.csv"
+  prescriptions:       "prescriptions.csv"
+  pharmacy:            "pharmacy.csv"
+  transfers:           "transfers.csv"
+  d_icd_diagnoses:     "d_icd_diagnoses.csv"
+  d_icd_procedures:    "d_icd_procedures.csv"
+  d_labitems:          "d_labitems.csv"
+output_parquet_root: "artifacts/raw_parquet/hosp"
+chunk_rows: 2_000_000     # adjust for RAM

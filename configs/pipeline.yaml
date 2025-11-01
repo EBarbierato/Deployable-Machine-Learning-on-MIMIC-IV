@@ -1,0 +1,37 @@
+project:
+  out_root: "/home_local/corte/comorbidity_artifacts"
+
+data:
+  hosp_root: "/home_local/corte/physionet.org/files/mimiciv/3.1/hosp"
+
+cohort:
+  horizon_days: 365
+
+features:
+  # leave empty for defaults, or add your switches here
+
+impute:
+  strategy: "sklearn_simple"   # (keeps leakage-safe fit on train only)
+
+baselines:
+  models: ["logistic","random_forest"]
+  select_metric: "auprc"
+
+calibration:
+  methods: ["platt","isotonic"]  # orchestrator will pick the best on val (lowest Brier)
+
+figures:
+  make_overlays: true
+  make_dca: true
+  make_reliability: true
+
+explain:
+  shap:
+    enabled: true
+    n_sample: 2000
+    bg: 200
+  permutation_importance:
+    enabled: true
+    metric: "auprc"
+    n_repeats: 10
+
